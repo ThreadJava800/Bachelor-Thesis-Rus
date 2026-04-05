@@ -75,3 +75,27 @@ uint32_t LrbCommit (
         }
     }
 }
+
+uint32_t LrbReserve (
+    LOCKLESS_RING_BUFFER *Rb,
+    const uint32_t MsgSize,
+    SHADOW_W_POS *Curr
+) {
+    for (;;) {
+        Curr->U = Rb->ShWPos.U;
+        uint32_t ReadPos = Rb->ReadPos;
+        uint32_t BusySize = Curr->S.ReservedPos - ReadPos;
+        if (BusySize > BUFFER_SIZE) {
+            // Буфер сломан:
+            // размер занятой области не может быть больше всего буфера. 
+            return -1;
+        }
+        if (BusySize + Size > BUFFER_SIZE) {
+            // Сообщение не поместилось.
+            // В зависимости от выбранного поведения, сообщение либо
+            // пропускается, либо ожидает завершения записи других.
+        }
+
+        ...
+    }
+}

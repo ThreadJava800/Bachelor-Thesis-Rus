@@ -61,6 +61,15 @@
 %% Красная строка
 \setlength{\parindent}{1.25cm}
 
+%% Моноширинный шрифт при 14pt основном тексте (cmtt не имеет T2A 14pt)
+\usepackage{url}
+\makeatletter
+\renewcommand{\texttt}[1]{%
+  {\footnotesize\fontencoding{T2A}\fontfamily{cmtt}\selectfont #1}%
+}
+\def\UrlFont{\footnotesize\fontencoding{T2A}\fontfamily{cmtt}\selectfont}
+\makeatother
+
 %% Интервалы
 \linespread{1.5}
 

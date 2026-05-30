@@ -1,3 +1,188 @@
 \section{Драйверы в операционной системе Windows}
 \label{sec:Chapter3} \index{Chapter3}
 
+Третья глава рассматривает архитектуру драйверов Windows и способы доступа
+пользовательских и режимных ядра компонентов к разделяемому кольцевому буферу,
+инициализированному прошивкой UEFI. Драйвер Windows завершает трёхкомпонентную
+схему канала диагностики «гость --- Stratovirt», описанную во введении.
+
+\subsection{Роль драйвера режима ядра}
+
+В гостевой Windows диагностические сообщения генерируют:
+\begin{itemize}
+    \item пользовательские приложения и службы;
+    \item другие драйверы режима ядра;
+    \item компоненты, уже использующие ETW или \texttt{DbgPrint}, если их
+    перенаправляют на общий API записи.
+\end{itemize}
+
+Драйвер режима ядра выступает единой точкой доступа к кольцевому буферу в
+физической памяти гостя: он отображает область, выполняет проверки целостности
+и уведомляет виртуальное устройство Stratovirt через MMIO-регистр \texttt{KICK}
+(глава~\ref{sec:Chapter1}). Это исключает прямой доступ user-mode к сырым
+физическим адресам и централизует политику безопасности.
+
+\subsection{Архитектура ввода-вывода Windows}
+
+Модель Windows разделяет выполнение на пользовательский режим и режим ядра.
+Запросы к устройствам оформляются как IRP (I/O Request Packet), которые
+проходят стек драйверов, начиная с I/O Manager~\cite{windows_wdk}.
+
+Для виртуального устройства без «железного» IRQ типична схема:
+\begin{enumerate}
+    \item PnP Manager обнаруживает устройство по ACPI;
+    \item функциональный драйвер создаёт \texttt{DEVICE\_OBJECT};
+    \item пользовательский код открывает символьную ссылку на устройство
+    (\texttt{\textbackslash{}.\textbackslash{}LogDev});
+    и вызывает \texttt{DeviceIoControl};
+    \item драйвер обрабатывает IOCTL и обращается к разделяемой памяти.
+\end{enumerate}
+
+\subsection{Модель разрабатываемого драйвера}
+
+В реализации используется классическая модель WDM (Windows Driver Model):
+точка входа \texttt{DriverEntry}, регистрация \texttt{DriverUnload},
+создание устройства через \texttt{IoCreateDevice}, установка флагов
+\texttt{DO\_BUFFERED\_IO} или \texttt{DO\_DIRECT\_IO} в зависимости от
+способа передачи IOCTL-буферов.
+
+Упрощённая сигнатура точки входа:
+
+\begin{lstlisting}
+NTSTATUS DriverEntry(
+    PDRIVER_OBJECT DriverObject,
+    PUNICODE_STRING RegistryPath
+);
+\end{lstlisting}
+
+В \texttt{DriverEntry} регистрируются:
+\begin{itemize}
+    \item \texttt{MajorFunction[IRP\_MJ\_CREATE]} --- открытие устройства;
+    \item \texttt{MajorFunction[IRP\_MJ\_CLOSE]} --- закрытие;
+    \item \texttt{MajorFunction[IRP\_MJ\_DEVICE\_CONTROL]} --- обработка IOCTL;
+    \item \texttt{DriverUnload} --- отмена отображения памяти и удаление устройства.
+\end{itemize}
+
+Альтернатива --- KMDF (создание очереди запросов \texttt{WdfIoQueue}), однако
+для устройства с фиксированным MMIO и ACPI-ресурсом WDM остаётся прозрачным
+и достаточным.
+
+\subsection{Обнаружение буфера через ACPI}
+\label{sec:acpi-logdev}
+
+Критично, что физический адрес и размер кольцевого буфера не зашиты в драйвер
+константами: их задаёт прошивка при выделении runtime-области, а Stratovirt
+публикует MMIO-интерфейс в ACPI.
+
+Эмулятор добавляет в таблицы ACPI устройство~\cite{stratovirt_repo}:
+\begin{itemize}
+    \item имя ACPI: \texttt{LOGD};
+    \item \texttt{\_HID}: строка \texttt{STVRT\_LOG};
+    \item \texttt{\_CRS}: дескриптор \texttt{Memory32Fixed} для MMIO-региона
+    LogDev (база и длина совпадают с картой standard VM, например
+    \texttt{0x0903\_0000}, размер \texttt{0x30}).
+\end{itemize}
+
+Драйвер Windows на этапе \texttt{IRP\_MN\_START\_DEVICE} получает список
+ресурсов \texttt{CM\_RESOURCE\_LIST}. Из него извлекается диапазон MMIO для
+регистров \texttt{BUFPTR}, \texttt{KICK} и др. Адрес кольцевого буфера в RAM
+гостя считывается записью в регистр \texttt{BUFPTR} на этапе инициализации
+(после того как UEFI записал туда физический адрес) либо передаётся через
+дополнительный ACPI-метод / таблицу конфигурации платформы, если она
+добавлена в образ прошивки.
+
+Далее драйвер отображает физическую страницу (или непрерывный диапазон)
+в системное виртуальное адресное пространство ядра функциями
+\texttt{MmMapIoSpace} / \texttt{MmGetPhysicalAddress} (в зависимости от
+типа памяти) и сохраняет указатель на структуру заголовка буфера, совместимую
+с прошивочным layout (раздел~\ref{sec:Chapter4}).
+
+Использование \texttt{\_HID = STVRT\_LOG} позволяет однозначно отличить
+виртуальную платформу Stratovirt от физической машины, где такого устройства
+нет, и не загружать драйвер на реальном железе.
+
+\subsection{Интерфейс IOCTL для пользовательского режима}
+
+Для приложений и служб user-mode предусмотрен IOCTL, принимающий готовое
+сообщение (NUL-терминированная строка или структура с полем длины).
+Обработчик в \texttt{IRP\_MJ\_DEVICE\_CONTROL}:
+\begin{enumerate}
+    \item проверяет входной буфер (\texttt{IoGetCurrentIrpStackLocation});
+    \item валидирует размер (не превышает максимального сообщения кольца);
+    \item вызывает общую функцию записи в lock-free буфер (та же, что в UEFI);
+    \item при успехе записывает в MMIO \texttt{KICK} значение \texttt{0xDEADBABA}
+    для пробуждения потока Stratovirt.
+\end{enumerate}
+
+Коды IOCTL задаются через \texttt{CTL\_CODE} с уникальным \texttt{DeviceType}
+и функциями \texttt{METHOD\_BUFFERED} (копирование буфера ядром) либо
+\texttt{METHOD\_NEITHER} при жёстком контроле Probe в драйвере~\cite{windows_wdk}.
+
+\subsection{Интерфейс для драйверов режима ядра}
+
+Второй IOCTL (или экспорт через \texttt{IoCreateDevice} + интерфейс
+\texttt{GUID}) возвращает указатель на функцию записи в буфер:
+\begin{lstlisting}
+typedef NTSTATUS (*LOGDEV_WRITE_FN)(
+    PVOID Message,
+    ULONG MessageSize
+);
+\end{lstlisting}
+
+Другой драйвер, получив указатель при инициализации, может логировать без
+прохождения user-kernel transition и без повторного отображения памяти.
+Это снижает задержку при высокой частоте событий от сетевого или дискового
+стека.
+
+Проверка подписи вызывающего модуля (опционально) выполняется через
+сравнение уровня IRQL и принадлежности к загруженным драйверам; в учебной
+реализации достаточно ограничить IOCTL привилегированным открытием устройства.
+
+\subsection{Взаимодействие с Stratovirt после записи}
+
+Последовательность для асинхронного режима совпадает с UEFI:
+\begin{enumerate}
+    \item \texttt{reserve} --- резервирование места в кольце (атомарные
+    операции над \texttt{ShWPos}, см.~раздел~\ref{sec:Chapter4});
+    \item копирование тела сообщения;
+    \item \texttt{commit} --- обновление \texttt{WritePos} при нулевом счётчике
+    активных писателей;
+    \item запись в MMIO \texttt{KICK} или явный \texttt{FLUSH}.
+\end{enumerate}
+
+Поток \texttt{iothread} на хосте считывает сообщения и печатает их в общий
+лог Stratovirt с префиксом \texttt{GUEST(ptr mode)}, что позволяет объединить
+их с логами эмулятора и с сообщениями UEFI, как указано во введении.
+
+\subsection{Сравнение путей доступа}
+
+\begin{table}[h]
+    \centering
+    \caption{Способы записи диагностики в гостевой Windows}
+    \label{tab:win-paths}
+    \begin{tabular}{|l|p{4cm}|p{5cm}|}
+        \hline
+        Клиент & API & Особенности \\
+        \hline
+        Приложение / служба & \texttt{CreateFile} + IOCTL &
+        Проверка буфера в ядре, стандартная модель безопасности \\
+        Другой драйвер & указатель \texttt{LOGDEV\_WRITE\_FN} &
+        Минимальная задержка, без syscall \\
+        Прошивка (до ОС) & DebugLib / MMIO &
+        Описано в главе~\ref{sec:Chapter2} \\
+        \hline
+    \end{tabular}
+\end{table}
+
+\subsection{Выводы по главе}
+
+\begin{enumerate}
+    \item Драйвер Windows связывает user-mode и kernel-mode клиентов с тем же
+    кольцевым буфером, что инициализирует UEFI.
+    \item ACPI \texttt{STVRT\_LOG} / \texttt{LOGD} обеспечивает обнаружение
+    MMIO-устройства и согласованность с Stratovirt.
+    \item Два IOCTL (запись сообщения и получение указателя на функцию записи)
+    покрывают основные сценарии диагностики в госте.
+    \item Детали lock-free алгоритма и структуры буфера приведены
+    в разделе~\ref{sec:Chapter4}.
+\end{enumerate}

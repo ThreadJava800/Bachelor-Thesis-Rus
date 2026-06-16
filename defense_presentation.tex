@@ -1,0 +1,260 @@
+\documentclass[aspectratio=169, 11pt]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{
+    \hfill
+    \usebeamerfont{page number in head/foot}
+    \insertframenumber{} / 14
+    \hspace{0.4cm}
+    \vspace{0.2cm}
+}
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[russian]{babel}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning}
+
+\title[Кольцевой буфер для диагностики ВМ]{
+    Применение многопоточного кольцевого буфера для организации
+    высокоскоростного обмена диагностической информацией в среде виртуализации
+}
+\author{Абубакиров Владимир Андреевич}
+\institute{
+    МФТИ, ФПМИ \\
+    Кафедра системного программирования ИСП РАН \\
+    \vspace{0.2cm}
+    Научный руководитель: к.ф.-м.н. Камкин А. С. \\
+    Научный консультант: Скородумов Д. П.
+}
+\date{Москва, 2026}
+
+\begin{document}
+
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}{Проблема}
+    \begin{itemize}
+        \item Современные виртуальные машины включают вспомогательные модули для более бесшовной работы.
+        \item Такие модули отвечают за общий буфер обмена, USB-перенаправление, синхронизацию времени и разрешения экрана.
+        \item Для отладки нужны диагностические сообщения из гостевой системы на хост.
+        \item Важны низкая задержка, высокая пропускная способность и корректная работа нескольких источников.
+        \item Отдельная сложность --- ранняя загрузка UEFI, когда общая память ещё недоступна.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Цель и задачи}
+    \textbf{Цель:} разработать и оценить комплекс компонентов для высокоскоростной передачи диагностической информации в среде виртуализации.
+
+    \vspace{0.4cm}
+    \begin{itemize}
+        \item Проанализировать существующие каналы передачи диагностических сообщений.
+        \item Обосновать выбор lock-free MPSC-кольцевого буфера.
+        \item Реализовать виртуальное устройство LogDev для Stratovirt.
+        \item Реализовать поддержку UEFI и Windows.
+        \item Проверить корректность прототипа и измерить накладные расходы.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Каналы передачи}
+    \begin{table}
+        \small
+        \begin{tabular}{p{0.26\textwidth} p{0.28\textwidth} p{0.34\textwidth}}
+            \toprule
+            Подход & Преимущества & Ограничения \\
+            \midrule
+            Serial/debugcon &
+            Простота, ранняя загрузка &
+            Частые выходы в эмулятор при побайтовой записи \\
+            \addlinespace
+            virtio-serial &
+            Стандартный виртуализированный канал &
+            Требует инициализации драйвера и неудобен для ранних стадий UEFI \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+\end{frame}
+
+\begin{frame}{Организация кольцевого буфера}
+    \begin{table}
+        \scriptsize
+        \begin{tabular}{p{0.25\textwidth} p{0.31\textwidth} p{0.34\textwidth}}
+            \toprule
+            Подход & Преимущества & Ограничения \\
+            \midrule
+            SPSC &
+            Простая и быстрая схема &
+            Поддерживает только одного писателя \\
+            \addlinespace
+            eBPF-style ring buffer &
+            Общий буфер событий с reserve/copy/commit &
+            Резервирование места защищено блокировкой \\
+            \addlinespace
+            MPSC без блокировок &
+            Несколько писателей без общей блокировки &
+            Нужно не открывать читателю незавершённые записи \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+\end{frame}
+
+\begin{frame}{Идея решения}
+    \begin{columns}[T]
+        \begin{column}{0.52\textwidth}
+            \begin{itemize}
+                \item Основной канал --- кольцевой буфер в RAM гостевой системы.
+                \item Несколько писателей: UEFI-модули, приложения и драйверы Windows.
+                \item Один читатель: виртуальное устройство LogDev в Stratovirt.
+                \item MMIO используется для настройки и уведомлений, а не для передачи каждого байта.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.45\textwidth}
+            \centering
+            \begin{tikzpicture}[
+                node distance=0.55cm,
+                box/.style={draw, rounded corners, align=center, minimum width=3.5cm, minimum height=0.8cm},
+                arr/.style={-{Latex[length=2mm]}, thick}
+            ]
+                \node[box] (guest) {Гостевая система\\UEFI / Windows};
+                \node[box, below=of guest] (buf) {Общая память\\MPSC ring buffer};
+                \node[box, below=of buf] (dev) {LogDev\\Stratovirt};
+                \node[box, below=of dev] (log) {Журнал на хосте};
+                \draw[arr] (guest) -- node[right]{запись} (buf);
+                \draw[arr] (guest.east) to[bend left=35] node[right]{KICK / FLUSH} (dev.east);
+                \draw[arr] (dev) -- node[right]{чтение} (buf);
+                \draw[arr] (dev) -- (log);
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Виртуальное устройство LogDev}
+    \begin{itemize}
+        \item Устройство подключается к SysBus Stratovirt и описывается в ACPI как \texttt{STVRT\_LOG}.
+        \item Основные MMIO-регистры:
+    \end{itemize}
+
+    \vspace{0.2cm}
+    \begin{table}
+        \small
+        \begin{tabular}{llp{0.55\textwidth}}
+            \toprule
+            Регистр & Доступ & Назначение \\
+            \midrule
+            \texttt{SYNC\_WR} & запись & синхронный вывод до появления буфера \\
+            \texttt{BUFPTR} & чтение/запись & адрес кольцевого буфера в памяти гостя \\
+            \texttt{KICK} & запись & уведомление о новых данных \\
+            \texttt{FLUSH} & запись & принудительное чтение буфера \\
+            \texttt{BUFSIZE} & чтение & размер полезной области буфера \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+\end{frame}
+
+\begin{frame}{Lock-free MPSC-буфер}
+    \begin{columns}[T]
+        \begin{column}{0.54\textwidth}
+            \begin{itemize}
+                \item MPSC соответствует модели: много источников в госте и один читатель на хосте.
+                \item В \texttt{SHADOW\_W\_POS} хранится мнимая позиция записи и число активных писателей.
+                \item \textbf{reserve}: CAS резервирует место и увеличивает счётчик писателей.
+                \item \textbf{commit}: CAS уменьшает счётчик; при нуле публикуется \texttt{WritePos}.
+                \item Читатель видит только опубликованную область до \texttt{WritePos}.
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.43\textwidth}
+            \centering
+            \begin{tikzpicture}[
+                stage/.style={draw, rounded corners, minimum width=2.8cm, minimum height=0.75cm, align=center},
+                arr/.style={-{Latex[length=2mm]}, thick}
+            ]
+                \node[stage] (r) {reserve\\CAS(\texttt{ShWPos})};
+                \node[stage, below=0.45cm of r] (c) {copy\\сообщение};
+                \node[stage, below=0.45cm of c] (m) {commit\\CAS + \texttt{WritePos}};
+                \draw[arr] (r) -- (c);
+                \draw[arr] (c) -- (m);
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Поддержка UEFI}
+    \begin{itemize}
+        \item На стадиях SEC и ранней PEI оперативная память недоступна, поэтому используется \texttt{SYNC\_WR}.
+        \item После инициализации RAM PEI-модуль выделяет runtime-память под кольцевой буфер.
+        \item Адрес буфера передаётся устройству через \texttt{BUFPTR}.
+        \item DXE-драйвер публикует протокол записи и подписывается на \texttt{SetVirtualAddressMap}.
+        \item Реализованная \texttt{DebugLib} перенаправляет стандартные \texttt{DEBUG} и \texttt{ASSERT} в LogDev.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Поддержка Windows}
+    \begin{itemize}
+        \item PnP Manager обнаруживает устройство по ACPI-описанию.
+        \item WDM-драйвер получает MMIO-ресурсы, адрес и размер буфера.
+        \item Для пользовательского режима предоставлен IOCTL для записи диагностических сообщений.
+        \item Для драйверов режима ядра предоставлен интерфейс получения функции записи.
+        \item При успешной записи драйвер уведомляет эмулятор через \texttt{KICK}.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Оценка решения}
+    \begin{itemize}
+        \item Функционально проверяются раннее журналирование UEFI, переход к буферу, несколько источников и единый хронологический журнал.
+        \item Производительность оценивается по задержке доставки и стоимости вызова записи.
+        \item Сравниваются три варианта: \texttt{virtio-serial}, LogDev lockless и LogDev eBPF-style.
+        \item Важно разделять задержку доставки до хоста и накладные расходы внутри гостевой системы.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Результаты измерений}
+    \begin{table}
+        \small
+        \begin{tabular}{lccc}
+            \toprule
+            Вариант & Потоки & Медиана доставки, мс & Сообщений/с \\
+            \midrule
+            \texttt{virtio-serial} & 1--16 & 68--70 & 3.4--4.1 тыс. \\
+            LogDev lockless & 1--16 & 335--337 & 8.8--20.1 тыс. \\
+            LogDev eBPF-style & 1--16 & 799--804 & 12.0--20.4 тыс. \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+
+    \vspace{0.25cm}
+    \begin{itemize}
+        \item \texttt{virtio-serial} быстрее доставляет сообщение до хоста.
+        \item LogDev имеет меньшую стоимость вызова записи в гостевой системе.
+        \item Внутри LogDev lockless-буфер даёт выигрыш по доставке примерно в 2.4 раза относительно eBPF-style.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Результаты работы}
+    \begin{itemize}
+        \item Разработана архитектура канала диагностики для Stratovirt.
+        \item Спроектировано виртуальное устройство LogDev и набор MMIO-регистров.
+        \item Обоснован и описан lock-free MPSC-кольцевой буфер.
+        \item Реализована поддержка UEFI, включая раннюю загрузку и \texttt{DebugLib}.
+        \item Реализован Windows-драйвер с интерфейсами для user mode и kernel mode.
+        \item Проведено сравнение с \texttt{virtio-serial} и eBPF-подобной организацией буфера.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Заключение}
+    \begin{itemize}
+        \item Предложенный механизм объединяет раннее журналирование UEFI и быстрый режим через общую память.
+        \item Lock-free MPSC-буфер подходит для нескольких источников диагностических сообщений.
+        \item MMIO-регистры используются лишь для синхронного раннего режима, настройки и уведомлений.
+        \item Дальнейшая работа: поддержка других ОС и расширение модели безопасности.
+    \end{itemize}
+
+    \vspace{0.5cm}
+    \centering
+    \Large Спасибо за внимание!
+\end{frame}
+
+\end{document}

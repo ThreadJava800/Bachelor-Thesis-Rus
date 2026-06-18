@@ -104,10 +104,9 @@ UEFI. Устройство добавляется в конфигурацию м
 
 \begin{table}[H]
     \centering
-    \caption{\textcolor{red}{Регистры MMIO устройства LogDev}}
+    \caption{Регистры MMIO устройства LogDev}
     \label{tab:logdev-regs}
-    \tiny
-    \begin{tabularx}{\textwidth}{|p{1.1cm}|p{2.2cm}|p{1.5cm}|>{\raggedright\arraybackslash}X|}
+    \begin{tabularx}{\textwidth}{|p{1.2cm}|p{2.0cm}|p{1.6cm}|>{\raggedright\arraybackslash}X|}
         \hline
         Смещ. & Имя & Доступ & Назначение \\
         \hline
@@ -176,20 +175,22 @@ typedef struct {
 повторяется.
 
 \begin{lstlisting}
-uint32_t LrbReserve(
+uint32_t LrbReserve (
     LOCKLESS_RING_BUFFER *Rb,
-    uint32_t MsgSize,
+    const uint32_t MsgSize,
     SHADOW_W_POS *Curr
 ) {
     for (;;) {
-        Curr->U = atomic_load(&Rb->ShWPos.U);
+        Curr->U = Rb->ShWPos.U;
+        SHADOW_W_POS Next = {
+            .S.ReservedPos = Curr->S.ReservedPos + MsgSize,
+            .S.WritePos = Curr->S.WriterCnt + 1
+        };
 
-        SHADOW_W_POS Next = *Curr;
-        Next.S.ReservedPos += MsgSize;
-        Next.S.WriterCnt += 1;
-
-        if (atomic_compare_exchange(
-                &Rb->ShWPos.U, &Curr->U, Next.U)) {
+        if (atomic_compare_exchange(&Rb->ShWPos, &Curr->U, Next.U)) {
+            // SHADOW_W_POS была обновлена в буфере
+            // Таким образом, гарантируется, что ни один другой поток
+            // не будет копировать своё сообщение в занятую память.
             return Curr->S.ReservedPos;
         }
     }
@@ -203,19 +204,21 @@ uint32_t LrbReserve(
 считывает частично скопированные сообщения.
 
 \begin{lstlisting}
-void LrbCommit(
+void LrbCommit (
     LOCKLESS_RING_BUFFER *Rb,
     SHADOW_W_POS *Curr
 ) {
     for (;;) {
-        SHADOW_W_POS Next = *Curr;
-        Next.S.WriterCnt -= 1;
+        SHADOW_W_POS NextShadowPos = {
+            .S.ReservedPos = Curr->S.ReservedPos,
+            .S.WritePos = Curr->S.WriterCnt - 1
+        };
 
-        if (atomic_compare_exchange(
-                &Rb->ShWPos.U, &Curr->U, Next.U)) {
-            if (Next.S.WriterCnt == 0) {
-                atomic_store(&Rb->WritePos, Next.S.ReservedPos);
-            }
+        if (NextShadowPos.S.WriterCnt == 0) {
+            // все сообщения до текущего закончили копирование
+            Rb->WritePos = Curr->S.ReservedPos;
+        }
+        if (atomic_compare_exchange(&Rb->ShWPos, &Curr->U, Next.U)) {
             return;
         }
     }
@@ -335,26 +338,34 @@ uint32_t LrbWrite(
 Если изменилось, проверка повторяется с актуальными значениями.
 
 \begin{lstlisting}
-uint32_t LrbGetBusySize(
+uint32_t LrbReserve (
     LOCKLESS_RING_BUFFER *Rb,
+    const uint32_t MsgSize,
     SHADOW_W_POS *Curr
 ) {
     for (;;) {
-        Curr->U = atomic_load(&Rb->ShWPos.U);
-        uint32_t ReadPos = atomic_load(&Rb->ReadPos);
+        Curr->U = Rb->ShWPos.U;
+        uint32_t ReadPos = Rb->ReadPos;
         uint32_t BusySize = Curr->S.ReservedPos - ReadPos;
 
-        if (BusySize <= BUFFER_SIZE) {
-            return BusySize;
+        while (BusySize > mRingBufferSize) {
+            CONST UINT64 CurrCpy = Curr->U;
+            MemoryFence();
+            Curr->U = Rb->ShWPos.U;
+            ReadPos = Rb->ReadPos;
+
+            if (Curr->U == CurrCpy) {
+                return -1;
+            }            
+            BusySize = Curr->S.ReservedPos - ReadPos;
+        }
+        if (BusySize + Size > BUFFER_SIZE) {
+            // Сообщение не поместилось.
+            // В зависимости от выбранного поведения, сообщение либо
+            // пропускается, либо ожидает завершения записи других.
         }
 
-        uint64_t OldShadow = Curr->U;
-        MemoryFence();
-        Curr->U = atomic_load(&Rb->ShWPos.U);
-
-        if (Curr->U == OldShadow) {
-            return BUFFER_CORRUPTED;
-        }
+        ...
     }
 }
 \end{lstlisting}
